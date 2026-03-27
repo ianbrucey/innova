@@ -122,6 +122,68 @@ const LINE_STATUS_COMPLETE      = 4;
 
 **Why these fields exist at all:** The client's existing system stores `AdminOrderStatus` on the *Order header*. That works fine when one party fulfills an entire order. It breaks completely for split orders — you can't mark the whole order "ready to ship" when only some of its items are going to the Irvine warehouse. These new columns (`FulfillmentSource`, `LineItemShipStatus`) give each line item its own independent routing state.
 
+---
+
+### The Split Order Problem — A Concrete Scenario
+
+This is the scenario you can walk the client through directly.
+
+**The order:**
+A customer places Order #16384 containing two items:
+- **Line Item A:** Wireless Headphones (SKU: `HDPH-BLK`) — Amazon stocks and ships this
+- **Line Item B:** Foam Ear Cushions (SKU: `CUSH-SM`) — Amazon does not carry this, Irvine ships it
+
+WebBee pushes the order to Amazon. Amazon accepts the headphones but rejects the ear cushions. The order now shows as **"Partially Fulfilled"** in Shopify — one line is Amazon's, one is not.
+
+---
+
+**What happens today (the broken flow):**
+
+Kim opens Shopify, sees Order #16384 is partially fulfilled, and checks Amazon Seller Central manually. She confirms Amazon is handling the headphones. She now needs to route only the ear cushions to Irvine.
+
+She runs her SQL script:
+
+```sql
+UPDATE [Order]
+SET AdminOrderStatus = 5, UpdateDate = GETDATE()
+WHERE OrderID = 16384
+```
+
+This sets `AdminOrderStatus = 5` on the **Order row** — a single row that represents the entire order. There is no instruction here about *which items* need to ship. The value `5` just means "this order is ready to ship" with no further detail.
+
+The warehouse's MS Access view queries for orders where `AdminOrderStatus = 5`. It returns Order #16384. The pick ticket prints. It shows both line items — the headphones and the ear cushions — because the system has no way to say "only the cushions." The warehouse has to rely on memory or a verbal instruction from Kim to know to skip the headphones.
+
+That night, the nightly sync runs:
+
+```sql
+SELECT * FROM [Order]
+WHERE AdminOrderStatus = 5
+AND TrackingNumber IS NOT NULL AND TrackingNumber != ''
+```
+
+It finds Order #16384. The FedEx tracking number is there (the warehouse shipped the ear cushions). The sync pushes the tracking number to Shopify and marks the order fulfilled — **closing both line items**, including the headphones line that Amazon is still in the middle of shipping.
+
+Now Shopify believes Irvine shipped the headphones. Amazon also ships the headphones. **The customer receives the headphones twice.**
+
+Even in the best case — where the warehouse correctly skips the headphones and Amazon doesn't double-ship — Shopify's fulfillment record is wrong. It says Irvine fulfilled everything. Reports, reconciliation, and any downstream process that reads Shopify fulfillment data are now corrupted for this order.
+
+---
+
+**What happens with our fix:**
+
+The Order header is left alone. Instead, we write routing decisions to each line item individually:
+
+| Line Item | SKU | FulfillmentSource | LineItemShipStatus |
+|---|---|---|---|
+| Line Item A (Headphones) | `HDPH-BLK` | `AMAZON` | `0` (pending — Amazon's problem) |
+| Line Item B (Ear Cushions) | `CUSH-SM` | `IRVINE` | `5` (ready to ship) |
+
+The warehouse sees only Line Item B in their queue. The nightly sync queries for line items where `FulfillmentSource = IRVINE AND LineItemShipStatus = 5 AND TrackingNumber IS NOT NULL`. It finds only the ear cushions. It calls Shopify's Fulfillment API for **that specific line item only**, with the FedEx tracking number. Line Item A (headphones) is never touched by our code. Amazon closes it on their side when they ship.
+
+Shopify ends up with an accurate record: Irvine fulfilled the ear cushions, Amazon fulfilled the headphones. No double-shipments. No corrupted data.
+
+---
+
 **The scopes** are the primary query interface for the rest of the app:
 
 ```php
