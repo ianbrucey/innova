@@ -6,35 +6,39 @@ A Laravel application that automates Innova's order fulfillment routing and nigh
 
 ## The Problem
 
-Innova sells products through Shopify. Some orders are fulfilled entirely by Amazon FBA. Some are fulfilled entirely by the Irvine warehouse. The hard case is split orders, where Amazon ships some items and Irvine ships the rest.
+Innova sells products through Shopify. 
 
-The original automation was built before split fulfillment existed. It tracks order status at the order level, not the line item level. That one design assumption causes a real operational failure.
+Some orders are fulfilled entirely by Amazon FBA. Some are fulfilled entirely by the Irvine warehouse. 
+
+The hard case is split orders, where Amazon ships some items and Irvine ships the rest.
+
+The original workflow tracks order status at the order level, not the line item level. This design assumption can cause a real operational failure.
 
 ### What Goes Wrong With a Split Order
 
-Take Order #16384. The customer ordered two items:
+FOR EXAMPLE: Take an Order `#16384`. The customer ordered two items:
 
-- Wireless Headphones (SKU: `HDPH-BLK`) -- Amazon stocks and ships this
-- Foam Ear Cushions (SKU: `CUSH-SM`) -- Amazon does not carry this, Irvine ships it
+- Wireless Headphones (SKU: `HDPH-BLK`) - Amazon stocks and ships this
+- Foam Ear Cushions (SKU: `CUSH-SM`) - Amazon does not carry this, Irvine ships it
 
 WebBee (existing middleware) pushes the order to Amazon. Amazon accepts the headphones, rejects the ear cushions. The order shows as Partially Fulfilled in Shopify.
 
-A staff member (Kim) manually identifies that the ear cushions need to go to Irvine. She runs a SQL UPDATE that sets `AdminOrderStatus = 5` on the Order row. That single row represents the entire order. There is no field on the row that says which items need to ship.
+A staff member (Kim N.) manually identifies that the ear cushions need to go to Irvine. He runs a SQL UPDATE that sets `AdminOrderStatus = 5` on the Order row. That single row represents the entire order. There is no field on the row that says which items need to ship.
 
-The warehouse sees the order in their Access view and gets a pick ticket showing both items. They have to know from context to only pack the ear cushions. The system gives them no instruction.
+**The warehouse sees the order in their Access view and gets a pick ticket showing >both items<. They have to know from context to only pack the ear cushions. The system gives them no instruction.**
 
-That night, the nightly sync script finds the order: `AdminOrderStatus = 5` with a FedEx tracking number. It closes every open line item on the order, including the headphones line that Amazon is still in the process of shipping. Shopify now believes Irvine fulfilled the headphones. Amazon ships the headphones too. The customer receives them twice.
+That night, the nightly sync script finds the order: `AdminOrderStatus = 5` with a FedEx tracking number. It closes every open line item on the order, including the headphones line that Amazon is still in the process of shipping. Shopify now believes Irvine fulfilled the headphones. Amazon ships the headphones too. At minimum, this is an inefficency in the record keeping, and at worse, a communication failure and the headphones are shipped twice .
 
 ### The Fix
 
 Instead of one status flag on the order header, we write a routing decision to each line item individually.
 
-| Line Item | SKU | FulfillmentSource | LineItemShipStatus |
-|---|---|---|---|
-| Headphones | `HDPH-BLK` | `AMAZON` | `0` (not our concern) |
-| Ear Cushions | `CUSH-SM` | `IRVINE` | `5` (ready to ship) |
+| Line Item    | SKU          | FulfillmentSource | LineItemShipStatus      |
+| ------------ | ------------ | ----------------- | ----------------------- |
+| Headphones   | `HDPH-BLK` | `AMAZON`        | `0` (not our concern) |
+| Ear Cushions | `CUSH-SM`  | `IRVINE`        | `5` (ready to ship)   |
 
-The warehouse queue shows only the ear cushions. The nightly sync closes only the ear cushions line in Shopify. Amazon's line is never touched by this application. No double-shipments.
+The warehouse queue shows only the ear cushions. The nightly sync closes only the ear cushions line in Shopify. Amazon's line is never touched by this application. Clear deliniation and no potential for double-shipments.
 
 ---
 
@@ -42,20 +46,20 @@ The warehouse queue shows only the ear cushions. The nightly sync closes only th
 
 Two Artisan commands run on a cron schedule and handle everything.
 
-### `innova:route-orders`
+### 1) `innova:route-orders`
 
 Runs every 15 minutes. Fetches open and partially fulfilled Shopify orders, determines which line items belong to Irvine, and writes that decision to the database.
 
 Decision logic per order:
 
-1. If the order is tagged `"rejected by Amazon"` (set by WebBee) -- all line items go to Irvine. No Amazon API call needed.
-2. Otherwise, query the Amazon SP-API to get the SKUs Amazon is fulfilling.
+1. If the order is tagged `"rejected by Amazon"` (set by WebBee) THEN all line items go to Irvine. No Amazon API call needed.
+2. Otherwise ***(for partially fulfilled orders)***, query the Amazon SP-API to get the SKUs Amazon is fulfilling.
 3. Line items matching an Amazon SKU are marked `SOURCE = AMAZON`.
 4. Remaining line items are marked `SOURCE = IRVINE` and `LineItemShipStatus = 5`.
 
 Amazon's fulfillment decision is binary per line item. They either take the entire line or reject it entirely. There is no quantity splitting within a line.
 
-### `innova:sync-fulfillments`
+### 2)  `innova:sync-fulfillments`
 
 Runs once daily at 5:30 PM Pacific (configurable via `NIGHTLY_SYNC_TIME` in `.env`). Handles the Shopify fulfillment close-out.
 
@@ -149,13 +153,13 @@ Outbound internet access from the VPC is available, which is what the Shopify an
 
 These are the only things blocking a `--dry-run` test against the real database:
 
-| Item | Where it matters |
-|---|---|
-| Shopify order number column on `Order` table | `FulfillmentRouterService` -- used to match Shopify orders to local DB records |
-| Shopify order ID column on `Order` table | `RunNightlySync` -- used to group line items before calling Shopify |
-| Confirm `OrderLineItem` table name | `OrderLineItem` model |
-| Confirm `Order` table name | `Order` model |
-| FedEx tracking column name | `OrderLineItem::scopeHasTracking()` and `getTrackingNumber()` |
+| Item                                           | Where it matters                                                                |
+| ---------------------------------------------- | ------------------------------------------------------------------------------- |
+| Shopify order number column on `Order` table | `FulfillmentRouterService` - used to match Shopify orders to local DB records |
+| Shopify order ID column on `Order` table     | `RunNightlySync` - used to group line items before calling Shopify            |
+| Confirm `OrderLineItem` table name           | `OrderLineItem` model                                                         |
+| Confirm `Order` table name                   | `Order` model                                                                 |
+| FedEx tracking column name                     | `OrderLineItem::scopeHasTracking()` and `getTrackingNumber()`               |
 
 All of these are env variables. Once confirmed, update `.env` and run with `--dry-run` to verify before going live.
 
