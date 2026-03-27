@@ -1,58 +1,170 @@
-<p align="center"><a href="https://laravel.com" target="_blank"><img src="https://raw.githubusercontent.com/laravel/art/master/logo-lockup/5%20SVG/2%20CMYK/1%20Full%20Color/laravel-logolockup-cmyk-red.svg" width="400" alt="Laravel Logo"></a></p>
+# Innova Fulfillment Automation
 
-<p align="center">
-<a href="https://github.com/laravel/framework/actions"><img src="https://github.com/laravel/framework/workflows/tests/badge.svg" alt="Build Status"></a>
-<a href="https://packagist.org/packages/laravel/framework"><img src="https://img.shields.io/packagist/dt/laravel/framework" alt="Total Downloads"></a>
-<a href="https://packagist.org/packages/laravel/framework"><img src="https://img.shields.io/packagist/v/laravel/framework" alt="Latest Stable Version"></a>
-<a href="https://packagist.org/packages/laravel/framework"><img src="https://img.shields.io/packagist/l/laravel/framework" alt="License"></a>
-</p>
+A Laravel application that automates Innova's order fulfillment routing and nightly Shopify sync. Replaces a daily manual process where staff had to cross-reference Shopify, Amazon Seller Central, and a local SQL Server database by hand.
 
-## About Laravel
+---
 
-Laravel is a web application framework with expressive, elegant syntax. We believe development must be an enjoyable and creative experience to be truly fulfilling. Laravel takes the pain out of development by easing common tasks used in many web projects, such as:
+## The Problem
 
-- [Simple, fast routing engine](https://laravel.com/docs/routing).
-- [Powerful dependency injection container](https://laravel.com/docs/container).
-- Multiple back-ends for [session](https://laravel.com/docs/session) and [cache](https://laravel.com/docs/cache) storage.
-- Expressive, intuitive [database ORM](https://laravel.com/docs/eloquent).
-- Database agnostic [schema migrations](https://laravel.com/docs/migrations).
-- [Robust background job processing](https://laravel.com/docs/queues).
-- [Real-time event broadcasting](https://laravel.com/docs/broadcasting).
+Innova sells products through Shopify. Some orders are fulfilled entirely by Amazon FBA. Some are fulfilled entirely by the Irvine warehouse. The hard case is split orders, where Amazon ships some items and Irvine ships the rest.
 
-Laravel is accessible, powerful, and provides tools required for large, robust applications.
+The original automation was built before split fulfillment existed. It tracks order status at the order level, not the line item level. That one design assumption causes a real operational failure.
 
-## Learning Laravel
+### What Goes Wrong With a Split Order
 
-Laravel has the most extensive and thorough [documentation](https://laravel.com/docs) and video tutorial library of all modern web application frameworks, making it a breeze to get started with the framework.
+Take Order #16384. The customer ordered two items:
 
-In addition, [Laracasts](https://laracasts.com) contains thousands of video tutorials on a range of topics including Laravel, modern PHP, unit testing, and JavaScript. Boost your skills by digging into our comprehensive video library.
+- Wireless Headphones (SKU: `HDPH-BLK`) -- Amazon stocks and ships this
+- Foam Ear Cushions (SKU: `CUSH-SM`) -- Amazon does not carry this, Irvine ships it
 
-You can also watch bite-sized lessons with real-world projects on [Laravel Learn](https://laravel.com/learn), where you will be guided through building a Laravel application from scratch while learning PHP fundamentals.
+WebBee (existing middleware) pushes the order to Amazon. Amazon accepts the headphones, rejects the ear cushions. The order shows as Partially Fulfilled in Shopify.
 
-## Agentic Development
+A staff member (Kim) manually identifies that the ear cushions need to go to Irvine. She runs a SQL UPDATE that sets `AdminOrderStatus = 5` on the Order row. That single row represents the entire order. There is no field on the row that says which items need to ship.
 
-Laravel's predictable structure and conventions make it ideal for AI coding agents like Claude Code, Cursor, and GitHub Copilot. Install [Laravel Boost](https://laravel.com/docs/ai) to supercharge your AI workflow:
+The warehouse sees the order in their Access view and gets a pick ticket showing both items. They have to know from context to only pack the ear cushions. The system gives them no instruction.
+
+That night, the nightly sync script finds the order: `AdminOrderStatus = 5` with a FedEx tracking number. It closes every open line item on the order, including the headphones line that Amazon is still in the process of shipping. Shopify now believes Irvine fulfilled the headphones. Amazon ships the headphones too. The customer receives them twice.
+
+### The Fix
+
+Instead of one status flag on the order header, we write a routing decision to each line item individually.
+
+| Line Item | SKU | FulfillmentSource | LineItemShipStatus |
+|---|---|---|---|
+| Headphones | `HDPH-BLK` | `AMAZON` | `0` (not our concern) |
+| Ear Cushions | `CUSH-SM` | `IRVINE` | `5` (ready to ship) |
+
+The warehouse queue shows only the ear cushions. The nightly sync closes only the ear cushions line in Shopify. Amazon's line is never touched by this application. No double-shipments.
+
+---
+
+## How It Works
+
+Two Artisan commands run on a cron schedule and handle everything.
+
+### `innova:route-orders`
+
+Runs every 15 minutes. Fetches open and partially fulfilled Shopify orders, determines which line items belong to Irvine, and writes that decision to the database.
+
+Decision logic per order:
+
+1. If the order is tagged `"rejected by Amazon"` (set by WebBee) -- all line items go to Irvine. No Amazon API call needed.
+2. Otherwise, query the Amazon SP-API to get the SKUs Amazon is fulfilling.
+3. Line items matching an Amazon SKU are marked `SOURCE = AMAZON`.
+4. Remaining line items are marked `SOURCE = IRVINE` and `LineItemShipStatus = 5`.
+
+Amazon's fulfillment decision is binary per line item. They either take the entire line or reject it entirely. There is no quantity splitting within a line.
+
+### `innova:sync-fulfillments`
+
+Runs once daily at 5:30 PM Pacific (configurable via `NIGHTLY_SYNC_TIME` in `.env`). Handles the Shopify fulfillment close-out.
+
+1. Query for all Irvine-routed line items where `LineItemShipStatus = 5` and a FedEx tracking number exists.
+2. Group by Shopify order.
+3. Call Shopify's Fulfillment API for those specific line items only, passing the tracking number.
+4. On success, update `LineItemShipStatus = 4` (complete).
+
+Both commands support `--dry-run` for safe testing before writing anything to the database or calling any external APIs.
 
 ```bash
-composer require laravel/boost --dev
-
-php artisan boost:install
+php artisan innova:route-orders --dry-run
+php artisan innova:sync-fulfillments --dry-run
 ```
 
-Boost provides your agent 15+ tools and skills that help agents build Laravel applications while following best practices.
+---
 
-## Contributing
+## Scheduler
 
-Thank you for considering contributing to the Laravel framework! The contribution guide can be found in the [Laravel documentation](https://laravel.com/docs/contributions).
+One crontab entry drives both commands:
 
-## Code of Conduct
+```
+* * * * * cd /path/to/project && php artisan schedule:run >> /dev/null 2>&1
+```
 
-In order to ensure that the Laravel community is welcoming to all, please review and abide by the [Code of Conduct](https://laravel.com/docs/contributions#code-of-conduct).
+The schedule is defined in `routes/console.php`.
 
-## Security Vulnerabilities
+---
 
-If you discover a security vulnerability within Laravel, please send an e-mail to Taylor Otwell via [taylor@laravel.com](mailto:taylor@laravel.com). All security vulnerabilities will be promptly addressed.
+## Setup
 
-## License
+### 1. Install dependencies
 
-The Laravel framework is open-sourced software licensed under the [MIT license](https://opensource.org/licenses/MIT).
+```bash
+composer install
+cp .env.example .env
+php artisan key:generate
+```
+
+### 2. Configure `.env`
+
+Fill in the required values:
+
+```env
+# Database (SQL Server inside the client VPC)
+DB_HOST=
+DB_DATABASE=
+DB_USERNAME=
+DB_PASSWORD=
+
+# Shopify
+SHOPIFY_DOMAIN=your-store.myshopify.com
+SHOPIFY_ACCESS_TOKEN=shpat_...
+
+# Amazon SP-API
+AMAZON_SP_CLIENT_ID=
+AMAZON_SP_CLIENT_SECRET=
+AMAZON_SP_REFRESH_TOKEN=
+```
+
+### 3. Set schema overrides
+
+The client's table and column names are not confirmed yet. Defaults are inferred from the discovery sessions. Update these once the schema dump is received:
+
+```env
+DB_TABLE_ORDER=Order
+DB_TABLE_ORDER_LINE_ITEM=OrderLineItem
+DB_COL_REQUIRES_SHIPPING=RequiresShipping
+DB_COL_TRACKING_NUMBER=TrackingNumber
+```
+
+### 4. Run the migration
+
+```bash
+php artisan migrate
+```
+
+This adds `FulfillmentSource`, `LineItemShipStatus`, `FulfillmentResolvedAt`, and `ShopifyLineItemId` to the `OrderLineItem` table. The existing `AdminOrderStatus` field on the `Order` table is not touched.
+
+---
+
+## Deployment
+
+The application must be deployed inside the client's AWS VPC. The SQL Server database is not publicly accessible -- it sits behind a VPN on a private network. Any server outside the VPC cannot reach it.
+
+Outbound internet access from the VPC is available, which is what the Shopify and Amazon API calls use.
+
+---
+
+## Remaining TODOs Before First Live Run
+
+These are the only things blocking a `--dry-run` test against the real database:
+
+| Item | Where it matters |
+|---|---|
+| Shopify order number column on `Order` table | `FulfillmentRouterService` -- used to match Shopify orders to local DB records |
+| Shopify order ID column on `Order` table | `RunNightlySync` -- used to group line items before calling Shopify |
+| Confirm `OrderLineItem` table name | `OrderLineItem` model |
+| Confirm `Order` table name | `Order` model |
+| FedEx tracking column name | `OrderLineItem::scopeHasTracking()` and `getTrackingNumber()` |
+
+All of these are env variables. Once confirmed, update `.env` and run with `--dry-run` to verify before going live.
+
+---
+
+## Phase Status
+
+**Phase 1 (current): Automation Engine**
+Both Artisan commands and all supporting services are built. Blocked only on schema confirmation.
+
+**Phase 2 (next): Warehouse Dashboard**
+A web UI showing all orders for the day with routing status, a manager approval flow, and Shopify fraud flags surfaced on each order. Not yet started.
